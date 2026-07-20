@@ -94,6 +94,28 @@ final class StockBarApp: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
+        add(menu, "新增標的…", action: #selector(addSymbol))
+
+        // 移除標的：子選單列出每一檔
+        let removeItem = NSMenuItem(title: "移除標的", action: nil, keyEquivalent: "")
+        if config.symbols.isEmpty {
+            removeItem.isEnabled = false
+        } else {
+            let sub = NSMenu()
+            for (i, sym) in config.symbols.enumerated() {
+                let name = quotes[sym.code]?.name ?? sym.code
+                let it = NSMenuItem(title: "\(name)（\(sym.code)）", action: #selector(removeSymbol(_:)), keyEquivalent: "")
+                it.target = self
+                it.tag = i
+                sub.addItem(it)
+            }
+            removeItem.submenu = sub
+        }
+        menu.addItem(removeItem)
+
+        menu.addItem(.separator())
+        let login = add(menu, "開機自動啟動", action: #selector(toggleLaunchAtLogin))
+        login.state = LaunchAgent.isEnabled ? .on : .off
         add(menu, "立即更新", action: #selector(manualRefresh))
         add(menu, "開啟設定檔…", action: #selector(openConfig))
         add(menu, "結束", action: #selector(quit), key: "q")
@@ -115,6 +137,48 @@ final class StockBarApp: NSObject, NSApplicationDelegate {
         config.activeIndex = sender.tag
         ConfigStore.save(config)      // 記住選擇
         renderActive()
+        buildMenu()
+    }
+
+    @objc private func addSymbol() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "新增追蹤標的"
+        alert.informativeText = "輸入股票代號（例：2330）。上櫃股票請勾選下方選項。"
+        alert.addButton(withTitle: "新增")
+        alert.addButton(withTitle: "取消")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 24, width: 220, height: 24))
+        field.placeholderString = "股票代號"
+        let otc = NSButton(checkboxWithTitle: "上櫃（otc）", target: nil, action: nil)
+        otc.frame = NSRect(x: 0, y: 0, width: 220, height: 20)
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 48))
+        container.addSubview(field)
+        container.addSubview(otc)
+        alert.accessoryView = container
+        alert.window.initialFirstResponder = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let code = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !code.isEmpty else { return }
+        guard !config.symbols.contains(where: { $0.code == code }) else { return }  // 去重
+        config.symbols.append(SymbolConfig(code: code, market: otc.state == .on ? "otc" : "tse"))
+        ConfigStore.save(config)
+        refresh()
+    }
+
+    @objc private func removeSymbol(_ sender: NSMenuItem) {
+        guard config.symbols.indices.contains(sender.tag) else { return }
+        config.symbols.remove(at: sender.tag)
+        // active 索引防呆
+        let i = config.activeIndex ?? 0
+        config.activeIndex = config.symbols.isEmpty ? 0 : min(i, config.symbols.count - 1)
+        ConfigStore.save(config)
+        refresh()
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        if LaunchAgent.isEnabled { LaunchAgent.disable() } else { LaunchAgent.enable() }
         buildMenu()
     }
 
