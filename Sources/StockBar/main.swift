@@ -84,27 +84,27 @@ final class StockBarApp: NSObject, NSApplicationDelegate {
             if let q = quotes[sym.code] {
                 let mut = NSMutableAttributedString(string: "\(q.name)  ")
                 mut.append(titleAttr(for: q, prefixCode: false))
-                let live = q.isLive ? "" : "  ·收盤"
+                let live = q.isLive ? "" : "  ·closed"
                 mut.append(NSAttributedString(string: live, attributes: [.foregroundColor: NSColor.secondaryLabelColor]))
                 item.attributedTitle = mut
             } else {
-                item.title = "\(sym.code)  載入中…"
+                item.title = "\(sym.code)  Loading…"
             }
             menu.addItem(item)
         }
 
         menu.addItem(.separator())
-        add(menu, "新增標的…", action: #selector(addSymbol))
+        add(menu, "Add Symbol…", action: #selector(addSymbol))
 
-        // 移除標的：子選單列出每一檔
-        let removeItem = NSMenuItem(title: "移除標的", action: nil, keyEquivalent: "")
+        // Remove: submenu listing every tracked symbol
+        let removeItem = NSMenuItem(title: "Remove Symbol", action: nil, keyEquivalent: "")
         if config.symbols.isEmpty {
             removeItem.isEnabled = false
         } else {
             let sub = NSMenu()
             for (i, sym) in config.symbols.enumerated() {
                 let name = quotes[sym.code]?.name ?? sym.code
-                let it = NSMenuItem(title: "\(name)（\(sym.code)）", action: #selector(removeSymbol(_:)), keyEquivalent: "")
+                let it = NSMenuItem(title: "\(name) (\(sym.code))", action: #selector(removeSymbol(_:)), keyEquivalent: "")
                 it.target = self
                 it.tag = i
                 sub.addItem(it)
@@ -114,11 +114,11 @@ final class StockBarApp: NSObject, NSApplicationDelegate {
         menu.addItem(removeItem)
 
         menu.addItem(.separator())
-        let login = add(menu, "開機自動啟動", action: #selector(toggleLaunchAtLogin))
+        let login = add(menu, "Launch at Login", action: #selector(toggleLaunchAtLogin))
         login.state = LaunchAgent.isEnabled ? .on : .off
-        add(menu, "立即更新", action: #selector(manualRefresh))
-        add(menu, "開啟設定檔…", action: #selector(openConfig))
-        add(menu, "結束", action: #selector(quit), key: "q")
+        add(menu, "Refresh Now", action: #selector(manualRefresh))
+        add(menu, "Open Config…", action: #selector(openConfig))
+        add(menu, "Quit", action: #selector(quit), key: "q")
         statusItem.menu = menu
     }
 
@@ -143,14 +143,14 @@ final class StockBarApp: NSObject, NSApplicationDelegate {
     @objc private func addSymbol() {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "新增追蹤標的"
-        alert.informativeText = "輸入股票代號（例：2330）。上櫃股票請勾選下方選項。"
-        alert.addButton(withTitle: "新增")
-        alert.addButton(withTitle: "取消")
+        alert.messageText = "Add Symbol"
+        alert.informativeText = "Enter a stock code (e.g. 2330). Check the box for OTC (上櫃) stocks."
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
 
         let field = NSTextField(frame: NSRect(x: 0, y: 24, width: 220, height: 24))
-        field.placeholderString = "股票代號"
-        let otc = NSButton(checkboxWithTitle: "上櫃（otc）", target: nil, action: nil)
+        field.placeholderString = "Stock code"
+        let otc = NSButton(checkboxWithTitle: "OTC (上櫃)", target: nil, action: nil)
         otc.frame = NSRect(x: 0, y: 0, width: 220, height: 20)
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 48))
         container.addSubview(field)
