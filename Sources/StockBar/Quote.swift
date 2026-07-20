@@ -18,11 +18,15 @@ enum QuoteError: Error { case network, badPayload, noData }
 /// TWSE 官方即時揭示 API（免 key、盤中約 5–20s 更新一次）
 enum TWSEClient {
 
-    static func fetch(_ code: String, completion: @escaping (Result<Quote, Error>) -> Void) {
-        // ex_ch 上市用 tse_、上櫃用 otc_。0050 是上市。
+    /// 一次查多檔（ex_ch 用 | 串接），回傳以 code 為 key 的字典。
+    /// 單次 request 省流量、也避免多檔各自 rate limit。
+    static func fetchMany(_ symbols: [SymbolConfig],
+                          completion: @escaping ([String: Quote]) -> Void) {
+        guard !symbols.isEmpty else { completion([:]); return }
+        let exch = symbols.map { $0.exCh }.joined(separator: "|")
         let ts = Int(Date().timeIntervalSince1970 * 1000)
-        let urlStr = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_\(code).tw&json=1&_=\(ts)"
-        guard let url = URL(string: urlStr) else { completion(.failure(QuoteError.network)); return }
+        let urlStr = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=\(exch)&json=1&_=\(ts)"
+        guard let url = URL(string: urlStr) else { completion([:]); return }
 
         var req = URLRequest(url: url, timeoutInterval: 8)
         // mis 端偶爾對無 Referer / UA 的請求給空 msgArray，補齊避免被擋
@@ -30,22 +34,22 @@ enum TWSEClient {
         req.setValue("https://mis.twse.com.tw/stock/fibest.jsp", forHTTPHeaderField: "Referer")
         req.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
 
-        URLSession.shared.dataTask(with: req) { data, _, err in
-            if err != nil { completion(.failure(QuoteError.network)); return }
-            guard let data = data else { completion(.failure(QuoteError.noData)); return }
-            guard let quote = parse(data, fallbackCode: code) else {
-                completion(.failure(QuoteError.badPayload)); return
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let arr = obj["msgArray"] as? [[String: Any]] else {
+                completion([:]); return
             }
-            completion(.success(quote))
+            var out: [String: Quote] = [:]
+            for m in arr {
+                if let q = parse(m) { out[q.code] = q }
+            }
+            completion(out)
         }.resume()
     }
 
-    private static func parse(_ data: Data, fallbackCode: String) -> Quote? {
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let arr = obj["msgArray"] as? [[String: Any]],
-              let m = arr.first else { return nil }
-
-        let code = (m["c"] as? String) ?? fallbackCode
+    private static func parse(_ m: [String: Any]) -> Quote? {
+        guard let code = m["c"] as? String else { return nil }
         let name = (m["n"] as? String) ?? code
         let prevClose = num(m["y"])            // 昨收
         let time = (m["t"] as? String) ?? ""
