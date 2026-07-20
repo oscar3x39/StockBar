@@ -56,7 +56,7 @@ final class StockBarApp: NSObject, NSApplicationDelegate {
             if quotes.isEmpty { statusItem.button?.title = "StockBar —" }
             return
         }
-        statusItem.button?.attributedTitle = titleAttr(for: q, prefixCode: true)
+        statusItem.button?.attributedTitle = titleAttr(for: q, prefixCode: false)
     }
 
     /// 產生「代號 價格 ▲漲跌%」的著色字串
