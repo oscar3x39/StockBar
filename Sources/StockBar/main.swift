@@ -30,10 +30,22 @@ final class StockBarApp: NSObject, NSApplicationDelegate {
     // MARK: - 排程（盤中依設定秒數、盤後拉長到 5 分鐘省流量）
     private func scheduleNext() {
         timer?.invalidate()
-        let interval: TimeInterval = TradingCalendar.isOpen(Date()) ? config.refresh : 300
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
-            self?.refresh()
-            self?.scheduleNext()   // 依當下盤別 / 最新設定重新決定間隔
+        if TradingCalendar.isOpen(Date()) {
+            // 開盤：保持即時 ticker，依設定秒數輪詢。
+            let t = Timer.scheduledTimer(withTimeInterval: config.refresh, repeats: false) { [weak self] _ in
+                self?.refresh()
+                self?.scheduleNext()
+            }
+            t.tolerance = max(1, config.refresh / 5)   // 讓 macOS 合併喚醒、省電
+            timer = t
+        } else {
+            // 省電：收盤/週末/假日「完全不抓報價」——股價不動，抓了也一樣。
+            // 只留一個低頻(30 分)時鐘檢查盤別（近乎零成本），開盤即自動恢復輪詢。
+            let t = Timer.scheduledTimer(withTimeInterval: 1800, repeats: false) { [weak self] _ in
+                self?.scheduleNext()
+            }
+            t.tolerance = 300
+            timer = t
         }
     }
 
