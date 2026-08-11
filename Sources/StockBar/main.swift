@@ -165,6 +165,7 @@ final class StockBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         login.state = LaunchAgent.isEnabled ? .on : .off
         add(menu, "Refresh Now", action: #selector(manualRefresh))
         add(menu, "Open Config…", action: #selector(openConfig))
+        add(menu, "Check for Updates…", action: #selector(checkForUpdates))
         add(menu, "Quit", action: #selector(quit), key: "q")
     }
 
@@ -229,6 +230,35 @@ final class StockBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func manualRefresh() { refresh() }
+
+    /// 只比對版本、只開 release 頁；不下載、不替換（理由見 Updater.swift）
+    @objc private func checkForUpdates() {
+        Updater.check { [weak self] result in
+            guard self != nil else { return }
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            switch result {
+            case .available(let latest, let current):
+                alert.messageText = "Update available"
+                alert.informativeText = "StockBar \(latest) is out (you have \(current))."
+                alert.addButton(withTitle: "Open Release Page")
+                alert.addButton(withTitle: "Later")
+                if alert.runModal() == .alertFirstButtonReturn {
+                    NSWorkspace.shared.open(Updater.releasesPage)
+                }
+            case .upToDate(let current):
+                alert.messageText = "You're up to date"
+                alert.informativeText = "StockBar \(current) is the latest release."
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            case .failed:
+                alert.messageText = "Couldn't check for updates"
+                alert.informativeText = "GitHub was unreachable or returned no release. Try again later."
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
+        }
+    }
 
     @objc private func openConfig() {
         ConfigStore.save(config)      // 確保檔案存在再開
