@@ -1,10 +1,12 @@
 import AppKit
 
 /// menu-bar app：顯示台股即時價（可多檔設定），盤中每 15s 更新（時差 <1 分鐘）
-final class StockBarApp: NSObject, NSApplicationDelegate {
+final class StockBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var statusItem: NSStatusItem!
     private var timer: Timer?
+    /// 單一 menu 實例：選單開著時只改內容、不整個換掉（換掉的話開著那份不會更新）
+    private let menu = NSMenu()
     private var config = AppConfig.default
     private var quotes: [String: Quote] = [:]   // code -> 最新報價
 
@@ -22,29 +24,47 @@ final class StockBarApp: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "StockBar …"
         config = ConfigStore.load()
+        menu.delegate = self
+        statusItem.menu = menu
         buildMenu()
         refresh()
         scheduleNext()
+
+        // 合蓋期間 timer 不會 fire，醒來先補一次，避免看到過期價格
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(didWake),
+            name: NSWorkspace.didWakeNotification, object: nil)
     }
+
+    @objc private func didWake() {
+        refresh()
+        scheduleNext()
+    }
+
+    /// 選單一打開就補抓一次，滑鼠停在上面的期間也照常輪詢（timer 已註冊 .common mode）
+    func menuWillOpen(_ menu: NSMenu) { refresh() }
 
     // MARK: - 排程（盤中依設定秒數、盤後拉長到 5 分鐘省流量）
     private func scheduleNext() {
         timer?.invalidate()
         if TradingCalendar.isOpen(Date()) {
             // 開盤：保持即時 ticker，依設定秒數輪詢。
-            let t = Timer.scheduledTimer(withTimeInterval: config.refresh, repeats: false) { [weak self] _ in
+            let t = Timer(timeInterval: config.refresh, repeats: false) { [weak self] _ in
                 self?.refresh()
                 self?.scheduleNext()
             }
             t.tolerance = max(1, config.refresh / 5)   // 讓 macOS 合併喚醒、省電
+            // .common：選單展開（eventTracking mode）時 timer 照樣 fire
+            RunLoop.main.add(t, forMode: .common)
             timer = t
         } else {
             // 省電：收盤/週末/假日「完全不抓報價」——股價不動，抓了也一樣。
-            // 只留一個低頻(30 分)時鐘檢查盤別（近乎零成本），開盤即自動恢復輪詢。
-            let t = Timer.scheduledTimer(withTimeInterval: 1800, repeats: false) { [weak self] _ in
+            // 只留一個 60s 時鐘檢查盤別（純本地計算、零網路），開盤後最多晚 1 分鐘恢復輪詢。
+            let t = Timer(timeInterval: 60, repeats: false) { [weak self] _ in
                 self?.scheduleNext()
             }
-            t.tolerance = 300
+            t.tolerance = 10
+            RunLoop.main.add(t, forMode: .common)
             timer = t
         }
     }
@@ -57,7 +77,7 @@ final class StockBarApp: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
                 if !result.isEmpty { self.quotes = result }
                 self.renderActive()
-                self.buildMenu()
+                if !self.updateQuoteRows() { self.buildMenu() }
             }
         }
     }
@@ -83,25 +103,40 @@ final class StockBarApp: NSObject, NSApplicationDelegate {
         ])
     }
 
+    /// 只重畫報價那幾列；選單開著時走這條，避免整份重建造成閃爍。
+    /// 結構有變（增刪標的）回 false，交給 buildMenu 全建。
+    private func updateQuoteRows() -> Bool {
+        guard menu.numberOfItems >= config.symbols.count else { return false }
+        for (i, sym) in config.symbols.enumerated() {
+            guard let item = menu.item(at: i),
+                  item.action == #selector(selectSymbol(_:)) else { return false }
+            render(sym, into: item, index: i)
+        }
+        return true
+    }
+
+    private func render(_ sym: SymbolConfig, into item: NSMenuItem, index: Int) {
+        item.target = self
+        item.tag = index
+        item.state = (sym.code == activeSymbol?.code) ? .on : .off
+        if let q = quotes[sym.code] {
+            let mut = NSMutableAttributedString(string: "\(q.name)  ")
+            mut.append(titleAttr(for: q, prefixCode: false))
+            let live = q.isLive ? "" : "  ·closed"
+            mut.append(NSAttributedString(string: live, attributes: [.foregroundColor: NSColor.secondaryLabelColor]))
+            item.attributedTitle = mut
+        } else {
+            item.title = "\(sym.code)  Loading…"
+        }
+    }
+
     private func buildMenu() {
-        let menu = NSMenu()
-        let activeCode = activeSymbol?.code
+        menu.removeAllItems()
 
         // 每檔一列：點選即設為作用中（顯示在 menu bar）
         for (i, sym) in config.symbols.enumerated() {
             let item = NSMenuItem(title: "", action: #selector(selectSymbol(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = i
-            item.state = (sym.code == activeCode) ? .on : .off
-            if let q = quotes[sym.code] {
-                let mut = NSMutableAttributedString(string: "\(q.name)  ")
-                mut.append(titleAttr(for: q, prefixCode: false))
-                let live = q.isLive ? "" : "  ·closed"
-                mut.append(NSAttributedString(string: live, attributes: [.foregroundColor: NSColor.secondaryLabelColor]))
-                item.attributedTitle = mut
-            } else {
-                item.title = "\(sym.code)  Loading…"
-            }
+            render(sym, into: item, index: i)
             menu.addItem(item)
         }
 
@@ -131,7 +166,6 @@ final class StockBarApp: NSObject, NSApplicationDelegate {
         add(menu, "Refresh Now", action: #selector(manualRefresh))
         add(menu, "Open Config…", action: #selector(openConfig))
         add(menu, "Quit", action: #selector(quit), key: "q")
-        statusItem.menu = menu
     }
 
     @discardableResult
