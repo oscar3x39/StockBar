@@ -11,6 +11,7 @@ struct Quote {
     var unit: String = ""   // 計價單位（幣：USDT / TWD；台股留空）
     var usdPrice: Double? = nil // 美元價（美股 = price、幣 = USDT 價；台股 nil），美元成本用
     var twdPrice: Double? = nil // 台幣價（算台幣損益用）；台股=price，幣/美股匯率抓不到為 nil
+    var asOf: Date? = nil       // 資料本身的時間（台股撮合時間、美股交易日、幣行情時間）
 
     var change: Double { price - prevClose }
     var changePct: Double { prevClose == 0 ? 0 : change / prevClose * 100 }
@@ -60,12 +61,18 @@ enum TWSEClient {
         // 現價優先序：成交價 z → 最佳買價 b → 最佳賣價 a → 昨收
         let z = num(m["z"])                    // "-" 會被 num 轉成 0
         if z > 0 {
-            return Quote(code: code, name: name, price: z, prevClose: prevClose, time: time, isLive: true, twdPrice: z)
+            return Quote(code: code, name: name, price: z, prevClose: prevClose, time: time, isLive: true, twdPrice: z, asOf: asOf(m))
         }
         let bid = firstOfList(m["b"])          // "195.10_195.05_..." 取第一檔
         let ask = firstOfList(m["a"])
         let fallback = bid > 0 ? bid : (ask > 0 ? ask : prevClose)
-        return Quote(code: code, name: name, price: fallback, prevClose: prevClose, time: time, isLive: false, twdPrice: fallback)
+        return Quote(code: code, name: name, price: fallback, prevClose: prevClose, time: time, isLive: false, twdPrice: fallback, asOf: asOf(m))
+    }
+
+    /// tlong：撮合時間（epoch 毫秒）
+    private static func asOf(_ m: [String: Any]) -> Date? {
+        guard let s = m["tlong"] as? String, let ms = Double(s), ms > 0 else { return nil }
+        return Date(timeIntervalSince1970: ms / 1000)
     }
 
     /// TWSE 欄位是字串，"-" / "" 視為 0

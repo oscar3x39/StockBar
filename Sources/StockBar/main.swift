@@ -49,13 +49,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         let L = store.L
         if store.showingHoldings {
-            // 台幣總未實現損益：「損益 ▲+1,234 (+0.37%)」
-            guard let t = store.holdingsTotal else {
-                statusItem.button?.title = L.t("P&L …", "損益 …"); return
+            // 台幣損益：「今日 ▲+1,234 (+0.37%)」或「累計 ▲…」
+            let today = store.config.menuBarToday
+            let label = today ? store.periodLabel : L.t("Total", "累計")
+            let value: (pnl: Double, pct: Double)?
+            if today {
+                value = store.periodTotal
+            } else {
+                value = store.holdingsTotal.map { ($0.pnl, $0.pct) }
             }
+            guard let t = value else {
+                statusItem.button?.title = "\(label) …"; return
+            }
+            // 隱私模式只顯示 %
+            let body = store.privacy ? Fmt.pct(t.pct) : "\(Fmt.signedMoney(t.pnl)) (\(Fmt.pct(t.pct)))"
             statusItem.button?.attributedTitle = NSAttributedString(
-                string: "\(L.t("P&L", "損益")) \(arrow(t.pnl))\(Fmt.signedMoney(t.pnl)) (\(Fmt.pct(t.pct)))",
+                string: "\(label) \(arrow(t.pnl))\(body)",
                 attributes: [.foregroundColor: color(t.pnl), .font: font])
+            return
+        }
+        if store.privacy, store.activeSymbol?.hideInPrivacy == true {
+            statusItem.button?.title = "StockBar"
             return
         }
         guard let sym = store.activeSymbol, let q = store.quotes[sym.code] else {

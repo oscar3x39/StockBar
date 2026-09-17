@@ -135,6 +135,14 @@ private struct MainPanel: View {
                 .padding(.horizontal, 7).padding(.vertical, 2)
                 .background(Capsule().fill(Color.black.opacity(0.06)))
             Spacer()
+            // 隱私模式：工作場合一鍵遮住金額，只留 %
+            Button { store.togglePrivacy() } label: {
+                Image(systemName: store.privacy ? "eye.slash.fill" : "eye.fill")
+                    .font(.system(size: 15)).foregroundColor(store.privacy ? Style.ink : Style.sub)
+                    .frame(width: 24, height: 24).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(store.privacy ? L.t("Show amounts", "顯示金額") : L.t("Hide amounts", "隱藏金額"))
             Button(action: onSettings) {
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: 16)).foregroundColor(Style.sub)
@@ -148,21 +156,25 @@ private struct MainPanel: View {
         Button { store.setShowHoldings(!store.showingHoldings) } label: {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Text(L.t("UNREALIZED P&L (TWD)", "台幣未實現損益"))
+                    Text(L.t("P&L (TWD)", "台幣損益"))
                         .font(.system(size: 11, weight: .bold)).foregroundColor(Style.sub).tracking(0.6)
                     Spacer()
                     menuBarMark(store.showingHoldings)
                 }
                 if let t = store.holdingsTotal {
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(Fmt.signedMoney(t.pnl))
-                            .font(.system(size: 28, weight: .bold).monospacedDigit())
-                            .foregroundColor(Style.tint(t.pnl))
-                        pctBadge(t.pct)
+                    // 今日 / 累計並排；今日放左邊，是最常看的
+                    HStack(alignment: .top, spacing: 12) {
+                        pnlBlock(store.periodLabel,
+                                 store.periodTotal?.pnl, store.periodTotal?.pct,
+                                 inMenuBar: store.showingHoldings && store.config.menuBarToday)
+                        pnlBlock(L.t("Total", "累計"), t.pnl, t.pct,
+                                 inMenuBar: store.showingHoldings && !store.config.menuBarToday)
                     }
-                    HStack(spacing: 14) {
-                        stat(L.t("Value", "市值"), Fmt.money(t.value))
-                        stat(L.t("Cost", "成本"), Fmt.money(t.cost))
+                    if !store.privacy {
+                        HStack(spacing: 14) {
+                            stat(L.t("Value", "市值"), Fmt.money(t.value))
+                            stat(L.t("Cost", "成本"), Fmt.money(t.cost))
+                        }
                     }
                     excludedNote
                 } else {
@@ -179,11 +191,49 @@ private struct MainPanel: View {
         .help(L.t("Click to show in the menu bar", "點一下顯示在選單列"))
     }
 
+    /// 一格損益：標題、金額（隱私模式改顯示 %）、% 徽章
+    private func pnlBlock(_ title: String, _ pnl: Double?, _ pct: Double?, inMenuBar: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Text(title).font(.system(size: 12, weight: .semibold)).foregroundColor(Style.sub)
+                if inMenuBar {
+                    Image(systemName: "menubar.rectangle")
+                        .font(.system(size: 10)).foregroundColor(Style.ink)
+                        .help(L.t("Shown in the menu bar", "顯示在選單列"))
+                }
+            }
+            if let pnl = pnl, let pct = pct {
+                if store.privacy {
+                    Text(Fmt.pct(pct))
+                        .font(.system(size: 24, weight: .bold).monospacedDigit())
+                        .foregroundColor(Style.tint(pnl))
+                } else {
+                    Text(Fmt.signedMoney(pnl))
+                        .font(.system(size: 24, weight: .bold).monospacedDigit())
+                        .foregroundColor(Style.tint(pnl))
+                        .lineLimit(1).minimumScaleFactor(0.6)
+                    pctBadge(pct)
+                }
+            } else {
+                Text("—").font(.system(size: 24, weight: .bold)).foregroundColor(Style.sub)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     @ViewBuilder
     private var excludedNote: some View {
+        if store.todayIncludesCrypto {
+            Text(L.t("Crypto 'today' = last 24h.", "幣的「今日」為 24 小時漲跌。"))
+                .font(.system(size: 11)).foregroundColor(Style.sub)
+        }
         let codes = store.excludedCodes
         if !codes.isEmpty {
             Text(L.t("Not included: ", "未計入：") + codes.joined(separator: ", "))
+                .font(.system(size: 11)).foregroundColor(Style.sub)
+        }
+        if store.privacy {
+            Label(L.t("Amounts hidden", "金額已隱藏"), systemImage: "eye.slash")
                 .font(.system(size: 11)).foregroundColor(Style.sub)
         }
     }
@@ -202,14 +252,24 @@ private struct MainPanel: View {
             Label(L.t("Menu bar", "選單列"), systemImage: "menubar.rectangle")
                 .font(.system(size: 11, weight: .semibold)).foregroundColor(Style.ink)
                 .labelStyle(.titleAndIcon)
+        } else {
+            Text(L.t("Click to show in menu bar", "點一下顯示在選單列"))
+                .font(.system(size: 10.5)).foregroundColor(Style.sub.opacity(0.8))
         }
     }
 
     private var watchlist: some View {
         sectionView(L.t("WATCHLIST", "自選")) {
-            ForEach(Array(store.config.symbols.enumerated()), id: \.element.code) { i, sym in
+            ForEach(Array(store.visibleSymbols.enumerated()), id: \.element.code) { i, sym in
                 if i > 0 { rowDivider }
                 row(sym)
+            }
+            if store.hiddenCount > 0 {
+                if !store.visibleSymbols.isEmpty { rowDivider }
+                Label(L.t("\(store.hiddenCount) hidden", "已隱藏 \(store.hiddenCount) 檔"), systemImage: "eye.slash")
+                    .font(.system(size: 11.5)).foregroundColor(Style.sub)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
             }
         }
     }
@@ -255,22 +315,41 @@ private struct MainPanel: View {
 
     @ViewBuilder
     private func subline(_ sym: SymbolConfig, _ q: Quote?) -> some View {
-        if let amt = sym.amount {
-            HStack(spacing: 6) {
-                Text("× \(Fmt.amount(amt))")
-                if let h = store.holding(sym) {
-                    Text("≈ \(Fmt.money(h.value)) TWD")
+        if sym.amount != nil, store.privacy {
+            // 隱私模式：只留累計報酬率（今日 % 已在上一行）
+            if let h = store.holding(sym) {
+                HStack(spacing: 6) {
+                    Text(L.t("Total return", "累計報酬率"))
                     Spacer(minLength: 4)
-                    if !sym.inTotal {
-                        Text(L.t("excluded", "不計入"))
-                            .font(.system(size: 10, weight: .semibold))
-                            .padding(.horizontal, 5).padding(.vertical, 1)
-                            .background(Capsule().fill(Color.black.opacity(0.07)))
-                    }
-                    Text("\(Fmt.signedMoney(h.pnl)) (\(Fmt.pct(h.pct)))")
+                    if !sym.inTotal { excludedTag }
+                    Text(Fmt.pct(h.pct))
                         .fontWeight(.semibold)
-                        // 不計入總損益的用灰色，避免跟總數混在一起看
                         .foregroundColor(sym.inTotal ? Style.tint(h.pnl) : Style.sub)
+                }
+                .font(.system(size: 11.5).monospacedDigit())
+                .foregroundColor(Style.sub)
+            }
+        } else if let amt = sym.amount {
+            // 不計入總損益的用灰色，避免跟總數混在一起看
+            let tint = { (v: Double) in sym.inTotal ? Style.tint(v) : Style.sub }
+            VStack(spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("× \(Fmt.amount(amt))")
+                    if let h = store.holding(sym) { Text("≈ \(Fmt.money(h.value)) TWD") }
+                    Spacer(minLength: 4)
+                    if let d = store.periodPnL(sym) {
+                        Text(store.periodLabel)
+                        Text(Fmt.signedMoney(d)).fontWeight(.semibold).foregroundColor(tint(d))
+                    }
+                }
+                if let h = store.holding(sym) {
+                    HStack(spacing: 6) {
+                        Text(L.t("Total", "累計"))
+                        Spacer(minLength: 4)
+                        if !sym.inTotal { excludedTag }
+                        Text("\(Fmt.signedMoney(h.pnl)) (\(Fmt.pct(h.pct)))")
+                            .fontWeight(.semibold).foregroundColor(tint(h.pnl))
+                    }
                 }
             }
             .font(.system(size: 11.5).monospacedDigit())
@@ -287,22 +366,64 @@ private struct MainPanel: View {
         }
     }
 
+    private var excludedTag: some View {
+        Text(L.t("excluded", "不計入"))
+            .font(.system(size: 10, weight: .semibold))
+            .padding(.horizontal, 5).padding(.vertical, 1)
+            .background(Capsule().fill(Color.black.opacity(0.07)))
+    }
+
     /// 固定 24 小時制，不跟系統語系出現「上午」
-    private static let clock: DateFormatter = {
+    private static func formatter(_ format: String, _ tz: String) -> DateFormatter {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: tz)
+        f.dateFormat = format
+        return f
+    }
+    private static let twClock = formatter("HH:mm:ss", "Asia/Taipei")
+    private static let twDay = formatter("MM/dd", "Asia/Taipei")
+    private static let usDay = formatter("MM/dd", "America/New_York")
+    private static let localClock: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "HH:mm:ss"
         return f
     }()
 
+    /// 各市場資料時間：盤中顯示時間，收盤顯示「哪天收盤」，不再用抓取時間冒充即時
+    private var dataTimes: String {
+        let now = Date()
+        func latest(_ pick: (SymbolConfig) -> Bool) -> Date? {
+            store.visibleSymbols.filter(pick).compactMap { store.quotes[$0.code]?.asOf }.max()
+        }
+        var parts: [String] = []
+        if let d = latest({ $0.isTW }) {
+            let open = store.isOpen(.tw, now)
+            let today = Self.twDay.string(from: d) == Self.twDay.string(from: now)
+            parts.append(open ? L.t("TW ", "台股 ") + Self.twClock.string(from: d)
+                         // 收盤只標哪天：上櫃盤後定價等時段的時間戳會晚於 13:30，列時間反而誤導
+                         : L.t("TW ", "台股 ") + (today ? L.t("closed today", "今日收盤")
+                                                     : Self.twDay.string(from: d) + L.t(" close", " 收盤")))
+        }
+        if let d = latest({ $0.isUS }) {
+            parts.append(store.isOpen(.us, now)
+                         ? L.t("US ", "美股 ") + Self.localClock.string(from: d)
+                         : L.t("US ", "美股 ") + Self.usDay.string(from: d) + L.t(" close", " 收盤"))
+        }
+        if let d = latest({ $0.isCrypto }) {
+            parts.append(L.t("Crypto ", "幣 ") + Self.localClock.string(from: d))
+        }
+        return parts.joined(separator: " · ")
+    }
+
     private var footer: some View {
         HStack {
-            if let d = store.lastUpdate {
-                Text(L.t("Updated ", "更新於 ") + Self.clock.string(from: d))
-                    .font(.system(size: 12)).foregroundColor(Style.sub)
-            }
-            Spacer()
-            iconButton("arrow.clockwise", help: L.t("Refresh", "重新整理")) { store.refresh() }
+            Text(dataTimes)
+                .font(.system(size: 11.5).monospacedDigit()).foregroundColor(Style.sub)
+                .lineLimit(1).minimumScaleFactor(0.75)
+            Spacer(minLength: 6)
+            iconButton("arrow.clockwise", help: L.t("Refresh", "重新整理")) { store.refresh(force: true) }
         }
     }
 }
@@ -331,7 +452,19 @@ private struct SettingsPanel: View {
             }
 
             watchlistSection
-            if !ui.drafts.isEmpty { holdingsSection }
+            if store.privacy {
+                // 隱私模式下不攤開數量與成本
+                sectionView(L.t("HOLDINGS", "持倉")) {
+                    Label(L.t("Hidden in privacy mode. Tap the eye on the main page to edit.",
+                              "隱私模式中不顯示。回主畫面點眼睛關閉後即可編輯。"),
+                          systemImage: "eye.slash")
+                        .font(.system(size: 12)).foregroundColor(Style.sub)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+            } else if !ui.drafts.isEmpty {
+                holdingsSection
+            }
             displaySection
             generalSection
 
@@ -372,6 +505,15 @@ private struct SettingsPanel: View {
                     Text(sym.code).font(.system(size: 14, weight: .medium)).foregroundColor(Style.ink)
                     Text(marketName(sym)).font(.system(size: 11.5)).foregroundColor(Style.sub)
                     Spacer()
+                    let hidden = sym.hideInPrivacy ?? false
+                    Button { store.setHideInPrivacy(sym.code, !hidden) } label: {
+                        Image(systemName: hidden ? "eye.slash" : "eye")
+                            .font(.system(size: 14)).foregroundColor(hidden ? Style.ink : Style.sub.opacity(0.6))
+                            .frame(width: 22)
+                    }
+                    .buttonStyle(.plain)
+                    .help(hidden ? L.t("Hidden in privacy mode", "隱私模式時隱藏")
+                                 : L.t("Hide this in privacy mode", "隱私模式時隱藏這檔"))
                     Button { store.removeSymbol(sym.code) } label: {
                         Image(systemName: "minus.circle.fill")
                             .font(.system(size: 16)).foregroundColor(.red.opacity(0.85))
@@ -539,6 +681,16 @@ private struct SettingsPanel: View {
                 }.labelsHidden().pickerStyle(.segmented).fixedSize()
             }.rowPadding()
             rowDivider
+            // 期間損益：1 = 今日，最多 30 天
+            HStack {
+                Text(L.t("P&L period", "損益期間")).font(.system(size: 14)).foregroundColor(Style.ink)
+                Spacer()
+                Text(store.config.days == 1 ? L.t("Today", "今日") : L.t("\(store.config.days) days", "近 \(store.config.days) 天"))
+                    .font(.system(size: 13).monospacedDigit()).foregroundColor(Style.sub)
+                Stepper("", value: Binding(get: { store.config.days }, set: { store.setPnLDays($0) }), in: 1...30)
+                    .labelsHidden()
+            }.rowPadding()
+            rowDivider
             HStack {
                 Text(L.t("Show P&L in menu bar", "選單列顯示損益")).font(.system(size: 14)).foregroundColor(Style.ink)
                 Spacer()
@@ -546,6 +698,18 @@ private struct SettingsPanel: View {
                     .labelsHidden().toggleStyle(.switch).controlSize(.small)
                     .disabled(!store.hasHoldings)
             }.rowPadding()
+            if store.showingHoldings {
+                rowDivider
+                HStack {
+                    Text(L.t("Menu bar P&L", "選單列損益")).font(.system(size: 14)).foregroundColor(Style.ink)
+                    Spacer()
+                    Picker("", selection: Binding(get: { store.config.menuBarToday },
+                                                  set: { store.setMenuBarToday($0) })) {
+                        Text(store.periodLabel).tag(true)
+                        Text(L.t("Total", "累計")).tag(false)
+                    }.labelsHidden().pickerStyle(.segmented).fixedSize()
+                }.rowPadding()
+            }
         }
     }
 

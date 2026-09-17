@@ -10,6 +10,7 @@ struct SymbolConfig: Codable, Equatable {
     var costUSD: Double?    // 每單位成本（美元；幣視為 USDT）。costCurrency == "USD" 時使用
     var costCurrency: String?     // 成本幣別："USD"，nil = 台幣（台股固定台幣）
     var excludeFromTotal: Bool?   // true：個別仍顯示損益，但不併入總損益（nil = 計入）
+    var hideInPrivacy: Bool?      // true：隱私模式時整列不顯示
 
     /// 成本以美元記：報酬率 = 美元價格變動（與券商一致），不含匯率
     var costInUSD: Bool { !isTW && costCurrency == "USD" }
@@ -46,7 +47,14 @@ struct AppConfig: Codable {
     var activeIndex: Int?
     var cryptoCurrency: String?   // 幣價計價："USDT"(預設) 或 "TWD"
     var menuBarShowsHoldings: Bool?  // true：menu bar 顯示持倉總損益，取代單檔價格
+    var menuBarPnL: String?       // menu bar 損益顯示 "today"(預設) 或 "total"
+
+    var pnlDays: Int?             // 期間損益天數 1–30（1 = 今日）
+
+    var menuBarToday: Bool { menuBarPnL != "total" }
+    var days: Int { min(30, max(1, pnlDays ?? 1)) }
     var language: String?         // "en" / "zh"；未設定跟系統
+    var privacyMode: Bool?        // true：金額、數量一律遮住，只顯示 %
 
     var lang: AppLanguage { language.flatMap(AppLanguage.init(rawValue:)) ?? .system }
 
@@ -63,7 +71,8 @@ struct AppConfig: Codable {
         activeIndex: 0,
         cryptoCurrency: nil,
         menuBarShowsHoldings: nil,
-        language: nil
+        language: nil,
+        privacyMode: nil
     )
 }
 

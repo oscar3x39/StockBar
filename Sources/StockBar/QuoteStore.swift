@@ -13,8 +13,10 @@ struct Holding {
 final class QuoteStore: ObservableObject {
     @Published private(set) var config: AppConfig
     @Published private(set) var quotes: [String: Quote] = [:]   // code -> 最新報價
-    @Published private(set) var lastUpdate: Date?
     @Published private(set) var launchAtLogin = LaunchAgent.isEnabled
+    @Published private(set) var history: [String: HistoryClient.Series] = [:]   // code -> 日收盤
+
+    private var historyFetchedAt: [String: Date] = [:]
 
     /// menu bar 標題需要重畫時呼叫
     var onChange: (() -> Void)?
@@ -28,64 +30,126 @@ final class QuoteStore: ObservableObject {
     // MARK: - 輪詢
 
     func start() {
-        refresh()
+        refresh(force: true)
         scheduleNext()
         // 合蓋期間 timer 不會 fire，醒來先補一次，避免看到過期價格
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.refresh()
+            self?.refresh(force: true)
             self?.scheduleNext()
         }
     }
 
-    /// 任一市場開著（台股盤中 / 美股盤中 / 有追蹤幣）：依設定秒數輪詢，只抓開著的市場；
-    /// 否則只留 60s 本地時鐘等開盤（零網路）
+    /// 有市場開著（台股 / 美股盤中、或有追蹤幣）：依設定秒數跑；否則 60 秒一次。
+    /// 每次都呼叫 refresh()，實際要不要打 API 由 isDue 決定——沒到期就零網路。
     func scheduleNext() {
         timer?.invalidate()
         let now = Date()
-        let twOpen = TradingCalendar.isOpen(now)
-        let usOpen = TradingCalendar.isUSOpen(now) && !config.usStocks.isEmpty
-        let t: Timer
-        if twOpen || usOpen || !config.cryptos.isEmpty {
-            t = Timer(timeInterval: config.refresh, repeats: false) { [weak self] _ in
-                self?.refresh(includeTW: twOpen, includeUS: usOpen)
-                self?.scheduleNext()
-            }
-            t.tolerance = max(1, config.refresh / 5)   // 讓 macOS 合併喚醒、省電
-        } else {
-            t = Timer(timeInterval: 60, repeats: false) { [weak self] _ in self?.scheduleNext() }
-            t.tolerance = 10
+        let active = TradingCalendar.isOpen(now)
+            || (TradingCalendar.isUSOpen(now) && !config.usStocks.isEmpty)
+            || !config.cryptos.isEmpty
+        let interval = active ? config.refresh : 60
+        let t = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
+            self?.refresh()
+            self?.scheduleNext()
         }
+        t.tolerance = max(1, interval / 5)   // 讓 macOS 合併喚醒、省電
         RunLoop.main.add(t, forMode: .common)
         timer = t
     }
 
-    /// 收盤的市場不抓（價格不動）；手動 / 開面板 / 喚醒時預設全抓一次
-    func refresh(includeTW: Bool = true, includeUS: Bool = true) {
+    enum Market: CaseIterable { case tw, us, crypto }
+
+    private var lastFetch: [Market: Date] = [:]
+    private static let closedInterval: TimeInterval = 30 * 60
+
+    func isOpen(_ m: Market, _ now: Date = Date()) -> Bool {
+        switch m {
+        case .tw: return TradingCalendar.isOpen(now)
+        case .us: return TradingCalendar.isUSOpen(now)
+        case .crypto: return true
+        }
+    }
+
+    /// 開盤：依間隔（美股最快 60 秒，Yahoo 較容易限流）；
+    /// 收盤：收盤前抓的要補抓一次最終價，之後 30 分鐘一次
+    private func isDue(_ m: Market, _ now: Date) -> Bool {
+        guard let last = lastFetch[m] else { return true }
+        let elapsed = now.timeIntervalSince(last)
+        if isOpen(m, now) {
+            let interval = m == .us ? max(60, config.refresh) : config.refresh
+            return elapsed >= interval * 0.8   // 容忍 timer 提早觸發
+        }
+        let market: TradingCalendar.Market = m == .tw ? .tw : .us
+        if let close = TradingCalendar.lastClose(market, before: now), last < close { return true }
+        return elapsed >= Self.closedInterval
+    }
+
+    /// force：手動重新整理 / 喚醒 / 設定變更，無視間隔全抓
+    func refresh(force: Bool = false) {
         config = ConfigStore.load()   // 熱重載：使用者手動編輯設定檔後自動生效
-        let stocks = includeTW ? config.stocks : []
-        let us = includeUS ? config.usStocks : []
+        let now = Date()
+        func take(_ m: Market, _ syms: [SymbolConfig]) -> [SymbolConfig] {
+            guard !syms.isEmpty, force || isDue(m, now) else { return [] }
+            lastFetch[m] = now
+            return syms
+        }
+        let jobs: [(Market, [SymbolConfig])] = [
+            (.tw, take(.tw, config.stocks)),
+            (.us, take(.us, config.usStocks)),
+            (.crypto, take(.crypto, config.cryptos)),
+        ].filter { !$0.1.isEmpty }
+        refreshHistory()
+        guard !jobs.isEmpty else { return }
+
         let group = DispatchGroup()
         var merged: [String: Quote] = [:]   // 只在 main queue 寫入
-        group.enter()
-        TWSEClient.fetchMany(stocks) { r in
-            DispatchQueue.main.async { merged.merge(r) { $1 }; group.leave() }
-        }
-        group.enter()
-        CryptoClient.fetchMany(config.cryptos, currency: config.currency) { r in
-            DispatchQueue.main.async { merged.merge(r) { $1 }; group.leave() }
-        }
-        group.enter()
-        USStockClient.fetchMany(us, isOpen: TradingCalendar.isUSOpen(Date())) { r in
-            DispatchQueue.main.async { merged.merge(r) { $1 }; group.leave() }
+        for (m, syms) in jobs {
+            group.enter()
+            let done = { [weak self] (r: [String: Quote]) in
+                DispatchQueue.main.async {
+                    merged.merge(r) { $1 }
+                    // 收盤市場抓失敗：1 分鐘後可重試，不必等 30 分鐘
+                    if r.isEmpty, let self = self, !self.isOpen(m, now) {
+                        self.lastFetch[m] = now.addingTimeInterval(-Self.closedInterval + 60)
+                    }
+                    group.leave()
+                }
+            }
+            switch m {
+            case .tw: TWSEClient.fetchMany(syms, completion: done)
+            case .us: USStockClient.fetchMany(syms, isOpen: isOpen(.us, now), completion: done)
+            case .crypto: CryptoClient.fetchMany(syms, currency: config.currency, completion: done)
+            }
         }
         group.notify(queue: .main) { [weak self] in
             guard let self = self else { return }
             // 合併而非覆蓋：單一來源失敗或本輪沒抓時保留上一筆
             self.quotes.merge(merged) { $1 }
-            if !merged.isEmpty { self.lastUpdate = Date() }
             self.fillMissingCost()
             self.onChange?()
+        }
+    }
+
+    /// 期間 > 1 天才需要歷史收盤；日線一天才變一次，每檔 30 分鐘內不重抓
+    private func refreshHistory() {
+        guard config.days > 1 else { return }
+        let now = Date()
+        for sym in config.symbols where sym.amount != nil {
+            if let t = historyFetchedAt[sym.code], now.timeIntervalSince(t) < 30 * 60 { continue }
+            historyFetchedAt[sym.code] = now
+            HistoryClient.fetch(sym) { [weak self] series in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    if let series = series, !series.isEmpty {
+                        self.history[sym.code] = series
+                        self.onChange?()
+                    } else {
+                        // 失敗 5 分鐘後重試，不要每輪都打
+                        self.historyFetchedAt[sym.code] = Date().addingTimeInterval(-25 * 60)
+                    }
+                }
+            }
         }
     }
 
@@ -95,6 +159,15 @@ final class QuoteStore: ObservableObject {
         let i = config.activeIndex ?? 0
         return config.symbols.indices.contains(i) ? config.symbols[i] : config.symbols.first
     }
+
+    var privacy: Bool { config.privacyMode ?? false }
+
+    /// 主畫面要列出的標的（隱私模式時略過標成隱藏的）
+    var visibleSymbols: [SymbolConfig] {
+        privacy ? config.symbols.filter { !($0.hideInPrivacy ?? false) } : config.symbols
+    }
+
+    var hiddenCount: Int { config.symbols.count - visibleSymbols.count }
 
     var hasHoldings: Bool { config.symbols.contains { $0.amount != nil } }
     var showingHoldings: Bool { (config.menuBarShowsHoldings ?? false) && hasHoldings }
@@ -109,6 +182,47 @@ final class QuoteStore: ObservableObject {
         }
         guard let c = sym.costTWD else { return nil }
         return Holding(value: amt * pTWD, cost: amt * c)
+    }
+
+    /// 期間標題：1 天 = 今日，其餘「近 N 天」
+    var periodLabel: String {
+        config.days == 1 ? L.t("Today", "今日") : L.t("\(config.days)D", "近\(config.days)天")
+    }
+
+    /// 期間損益（台幣）= 數量 × (現價 − 基準價)，以當下匯率換台幣（不含匯率變動）。
+    /// 1 天：基準 = 昨收（幣沒有收盤，是 24 小時前價格）；
+    /// N 天：基準 = N 個日曆天前（含）最後一個交易日收盤。
+    func periodPnL(_ sym: SymbolConfig) -> Double? {
+        guard let amt = sym.amount, let q = quotes[sym.code], let pTWD = q.twdPrice, q.price > 0 else { return nil }
+        if config.days == 1 {
+            guard q.prevClose > 0 else { return nil }
+            return amt * q.change * (pTWD / q.price)
+        }
+        // 歷史收盤是原幣（台股 TWD、美股 USD、幣 USDT），現價也要用原幣比
+        guard let native = sym.isTW ? q.price : q.usdPrice, native > 0,
+              let series = history[sym.code],
+              let base = HistoryClient.close(in: series, onOrBefore: Date().addingTimeInterval(-Double(config.days) * 86400))
+        else { return nil }
+        return amt * (native - base) * (pTWD / native)
+    }
+
+    /// 計入總損益的持倉，期間損益合計；% 以期初市值為分母
+    var periodTotal: (pnl: Double, pct: Double)? {
+        var pnl = 0.0, value = 0.0, any = false
+        for sym in config.symbols where sym.inTotal {
+            guard let d = periodPnL(sym), let h = holding(sym) else { continue }
+            pnl += d
+            value += h.value
+            any = true
+        }
+        guard any else { return nil }
+        let yesterday = value - pnl
+        return (pnl, yesterday == 0 ? 0 : pnl / yesterday * 100)
+    }
+
+    /// 計入的持倉裡有幣且期間 = 1 天：今日損益是 24 小時漲跌，不是自然日
+    var todayIncludesCrypto: Bool {
+        config.days == 1 && config.symbols.contains { $0.inTotal && $0.amount != nil && $0.isCrypto }
     }
 
     /// 計入總損益的持倉合計；沒有回 nil
@@ -154,13 +268,27 @@ final class QuoteStore: ObservableObject {
 
     /// 有持倉但不計入總損益的代號
     var excludedCodes: [String] {
-        config.symbols.filter { $0.amount != nil && !$0.inTotal }.map(\.code)
+        visibleSymbols.filter { $0.amount != nil && !$0.inTotal }.map(\.code)
+    }
+
+    func togglePrivacy() { mutate { $0.privacyMode = $0.privacyMode == true ? nil : true } }
+
+    func setHideInPrivacy(_ code: String, _ hide: Bool) {
+        guard let i = config.symbols.firstIndex(where: { $0.code == code }) else { return }
+        mutate { $0.symbols[i].hideInPrivacy = hide ? true : nil }
     }
 
     func setInTotal(_ code: String, _ on: Bool) {
         guard let i = config.symbols.firstIndex(where: { $0.code == code }) else { return }
         mutate { $0.symbols[i].excludeFromTotal = on ? nil : true }
     }
+
+    func setPnLDays(_ d: Int) {
+        mutate { $0.pnlDays = min(30, max(1, d)) == 1 ? nil : min(30, max(1, d)) }
+        refreshHistory()
+    }
+
+    func setMenuBarToday(_ today: Bool) { mutate { $0.menuBarPnL = today ? nil : "total" } }
 
     func setShowHoldings(_ on: Bool) { mutate { $0.menuBarShowsHoldings = on ? true : nil } }
 
@@ -179,7 +307,7 @@ final class QuoteStore: ObservableObject {
             return L.t("\(code) is already in the list.", "\(code) 已在清單中。")
         }
         mutate { $0.symbols.append(SymbolConfig(code: code, market: market)) }
-        refresh()
+        refresh(force: true)
         scheduleNext()   // 新增幣 / 美股時，要依新市場重排輪詢
         return nil
     }
@@ -238,7 +366,7 @@ final class QuoteStore: ObservableObject {
         mutate { $0.cryptoCurrency = c.rawValue }
         // 丟掉舊幣別的報價，避免抓到新價前顯示錯單位的數字
         for sym in config.cryptos { quotes[sym.code] = nil }
-        refresh()
+        refresh(force: true)
     }
 
     func setLanguage(_ l: AppLanguage) { mutate { $0.language = l.rawValue } }

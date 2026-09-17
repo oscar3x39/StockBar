@@ -1,62 +1,50 @@
 import Foundation
 
-/// 美股：Yahoo Finance chart API（免 key、非官方，可能改版或限流——失敗時該檔本輪不更新）。
-/// 台幣價 = 美元價 × Yahoo USD/TWD（TWD=X）。
+/// 美股：Yahoo Finance spark API（免 key、非官方，可能改版或限流——失敗時本輪不更新）。
+/// 所有美股與 USD/TWD（TWD=X）合成 1 個請求；台幣價 = 美元價 × USD/TWD。
 enum USStockClient {
 
     static func fetchMany(_ symbols: [SymbolConfig], isOpen: Bool,
                           completion: @escaping ([String: Quote]) -> Void) {
         guard !symbols.isEmpty else { completion([:]); return }
-        let group = DispatchGroup()
-        let lock = NSLock()
-        var metas: [String: [String: Any]] = [:]
-        var usdTWD: Double?
-
-        for sym in symbols {
-            group.enter()
-            fetchMeta(sym.code) { m in
-                if let m = m { lock.lock(); metas[sym.code] = m; lock.unlock() }
-                group.leave()
-            }
-        }
-        group.enter()
-        fetchMeta("TWD=X") { m in
-            lock.lock(); usdTWD = num(m?["regularMarketPrice"]); lock.unlock()
-            group.leave()
-        }
-        group.notify(queue: .global()) {
-            var out: [String: Quote] = [:]
-            for (code, m) in metas {
-                guard let price = num(m["regularMarketPrice"]), price > 0 else { continue }
-                // range=1d 時 chartPreviousClose 即前一交易日收盤
-                let prev = num(m["chartPreviousClose"]) ?? num(m["previousClose"]) ?? price
-                out[code] = Quote(code: code, name: (m["shortName"] as? String) ?? code,
-                                  price: price, prevClose: prev, time: "", isLive: isOpen,
-                                  unit: "USD", usdPrice: price, twdPrice: usdTWD.map { price * $0 })
-            }
-            completion(out)
-        }
-    }
-
-    private static func fetchMeta(_ symbol: String, completion: @escaping ([String: Any]?) -> Void) {
-        let enc = symbol.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? symbol
-        guard let url = URL(string: "https://query1.finance.yahoo.com/v8/finance/chart/\(enc)?interval=1d&range=1d") else {
-            completion(nil); return
-        }
+        let list = (symbols.map { $0.code.uppercased() } + ["TWD=X"]).joined(separator: ",")
+        var comps = URLComponents(string: "https://query1.finance.yahoo.com/v8/finance/spark")!
+        comps.queryItems = [URLQueryItem(name: "symbols", value: list),
+                            URLQueryItem(name: "range", value: "1d"),
+                            URLQueryItem(name: "interval", value: "1d")]
+        guard let url = comps.url else { completion([:]); return }
         var req = URLRequest(url: url, timeoutInterval: 8)
         // 無 UA 時 Yahoo 常回 429
         req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+
         URLSession.shared.dataTask(with: req) { data, _, _ in
             guard let data = data,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let chart = obj["chart"] as? [String: Any],
-                  let result = (chart["result"] as? [[String: Any]])?.first,
-                  let meta = result["meta"] as? [String: Any] else {
-                completion(nil); return
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] else {
+                completion([:]); return
             }
-            completion(meta)
+            let usdTWD = last(obj["TWD=X"])?.price
+            var out: [String: Quote] = [:]
+            for sym in symbols {
+                guard let m = obj[sym.code.uppercased()], let l = last(m), l.price > 0 else { continue }
+                // range=1d 時 chartPreviousClose 即前一交易日收盤
+                let prev = (m["chartPreviousClose"] as? NSNumber)?.doubleValue ?? l.price
+                // 盤中資料時間用抓取當下；收盤後用該交易日（K 棒開盤時間）
+                out[sym.code] = Quote(code: sym.code, name: sym.code,
+                                      price: l.price, prevClose: prev, time: "", isLive: isOpen,
+                                      unit: "USD", usdPrice: l.price,
+                                      twdPrice: usdTWD.map { l.price * $0 },
+                                      asOf: isOpen ? Date() : l.at)
+            }
+            completion(out)
         }.resume()
     }
 
-    private static func num(_ v: Any?) -> Double? { (v as? NSNumber)?.doubleValue }
+    /// spark 每檔的最後一根 K：收盤價與時間
+    private static func last(_ m: [String: Any]?) -> (price: Double, at: Date)? {
+        guard let m = m,
+              let closes = m["close"] as? [Any],
+              let ts = m["timestamp"] as? [NSNumber],
+              let c = (closes.last as? NSNumber)?.doubleValue, let t = ts.last else { return nil }
+        return (c, Date(timeIntervalSince1970: t.doubleValue))
+    }
 }
