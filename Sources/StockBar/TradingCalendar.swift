@@ -13,4 +13,16 @@ enum TradingCalendar {
         let mins = h * 60 + m
         return mins >= 9 * 60 && mins <= 13 * 60 + 30    // 09:00–13:30
     }
+
+    /// 美股常規時段（America/New_York，週一~五 09:30–16:00，夏令時間由時區處理；不含美國假日）
+    static func isUSOpen(_ date: Date) -> Bool {
+        var cal = Calendar(identifier: .gregorian)
+        guard let tz = TimeZone(identifier: "America/New_York") else { return true }
+        cal.timeZone = tz
+        let c = cal.dateComponents([.weekday, .hour, .minute], from: date)
+        guard let wd = c.weekday, let h = c.hour, let m = c.minute else { return false }
+        if wd == 1 || wd == 7 { return false }
+        let mins = h * 60 + m
+        return mins >= 9 * 60 + 30 && mins <= 16 * 60
+    }
 }

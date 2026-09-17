@@ -1,276 +1,140 @@
 import AppKit
+import SwiftUI
 
-/// menu-bar app：顯示台股即時價（可多檔設定），盤中每 15s 更新（時差 <1 分鐘）
-final class StockBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
+/// 可成為 key 的無邊框面板，讓設定頁的輸入框能接收鍵盤
+final class KeyablePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
 
+/// AppKit 殼：menu bar 標題 + 無箭頭面板（SwiftUI）。業務邏輯都在 QuoteStore。
+/// 面板版面比照 ClaudeBar。
+final class AppDelegate: NSObject, NSApplicationDelegate {
+
+    private let store = QuoteStore()
     private var statusItem: NSStatusItem!
-    private var timer: Timer?
-    /// 單一 menu 實例：選單開著時只改內容、不整個換掉（換掉的話開著那份不會更新）
-    private let menu = NSMenu()
-    private var config = AppConfig.default
-    private var quotes: [String: Quote] = [:]   // code -> 最新報價
-
-    // 台股習慣：紅漲綠跌（與美股相反）
-    private let upColor = NSColor.systemRed
-    private let downColor = NSColor.systemGreen
-    private let flatColor = NSColor.labelColor
-
-    private var activeSymbol: SymbolConfig? {
-        let i = config.activeIndex ?? 0
-        return config.symbols.indices.contains(i) ? config.symbols[i] : config.symbols.first
-    }
+    private var panel: KeyablePanel!
+    private var clickMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "StockBar …"
-        config = ConfigStore.load()
-        menu.delegate = self
-        statusItem.menu = menu
-        buildMenu()
-        refresh()
-        scheduleNext()
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(togglePanel)
 
-        // 合蓋期間 timer 不會 fire，醒來先補一次，避免看到過期價格
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(didWake),
-            name: NSWorkspace.didWakeNotification, object: nil)
+        installEditMenu()
+
+        // 無邊框面板：沒有 NSPopover 的箭頭；圓角與陰影由 SwiftUI 內容處理
+        let p = KeyablePanel(contentRect: .zero,
+                             styleMask: [.borderless, .nonactivatingPanel],
+                             backing: .buffered, defer: false)
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
+        p.level = .popUpMenu
+        p.hidesOnDeactivate = false
+        p.animationBehavior = .utilityWindow
+        panel = p
+
+        store.onChange = { [weak self] in self?.updateTitle() }
+        store.start()
+
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(closePanel),
+            name: NSApplication.didResignActiveNotification, object: nil)
     }
 
-    @objc private func didWake() {
-        refresh()
-        scheduleNext()
-    }
+    // MARK: - menu bar 標題
 
-    /// 選單一打開就補抓一次，滑鼠停在上面的期間也照常輪詢（timer 已註冊 .common mode）
-    func menuWillOpen(_ menu: NSMenu) { refresh() }
-
-    // MARK: - 排程（盤中依設定秒數、盤後拉長到 5 分鐘省流量）
-    private func scheduleNext() {
-        timer?.invalidate()
-        if TradingCalendar.isOpen(Date()) {
-            // 開盤：保持即時 ticker，依設定秒數輪詢。
-            let t = Timer(timeInterval: config.refresh, repeats: false) { [weak self] _ in
-                self?.refresh()
-                self?.scheduleNext()
+    private func updateTitle() {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        let L = store.L
+        if store.showingHoldings {
+            // 台幣總未實現損益：「損益 ▲+1,234 (+0.37%)」
+            guard let t = store.holdingsTotal else {
+                statusItem.button?.title = L.t("P&L …", "損益 …"); return
             }
-            t.tolerance = max(1, config.refresh / 5)   // 讓 macOS 合併喚醒、省電
-            // .common：選單展開（eventTracking mode）時 timer 照樣 fire
-            RunLoop.main.add(t, forMode: .common)
-            timer = t
-        } else {
-            // 省電：收盤/週末/假日「完全不抓報價」——股價不動，抓了也一樣。
-            // 只留一個 60s 時鐘檢查盤別（純本地計算、零網路），開盤後最多晚 1 分鐘恢復輪詢。
-            let t = Timer(timeInterval: 60, repeats: false) { [weak self] _ in
-                self?.scheduleNext()
-            }
-            t.tolerance = 10
-            RunLoop.main.add(t, forMode: .common)
-            timer = t
-        }
-    }
-
-    private func refresh() {
-        config = ConfigStore.load()   // 熱重載：使用者編輯設定檔後自動生效
-        let symbols = config.symbols
-        TWSEClient.fetchMany(symbols) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if !result.isEmpty { self.quotes = result }
-                self.renderActive()
-                if !self.updateQuoteRows() { self.buildMenu() }
-            }
-        }
-    }
-
-    // MARK: - 畫面
-    private func renderActive() {
-        guard let sym = activeSymbol, let q = quotes[sym.code] else {
-            if quotes.isEmpty { statusItem.button?.title = "StockBar —" }
+            statusItem.button?.attributedTitle = NSAttributedString(
+                string: "\(L.t("P&L", "損益")) \(arrow(t.pnl))\(Fmt.signedMoney(t.pnl)) (\(Fmt.pct(t.pct)))",
+                attributes: [.foregroundColor: color(t.pnl), .font: font])
             return
         }
-        statusItem.button?.attributedTitle = titleAttr(for: q, prefixCode: false)
-    }
-
-    /// 產生「代號 價格 ▲漲跌%」的著色字串
-    private func titleAttr(for q: Quote, prefixCode: Bool) -> NSAttributedString {
-        let arrow = q.change > 0 ? "▲" : (q.change < 0 ? "▼" : "＝")
-        let color = q.change > 0 ? upColor : (q.change < 0 ? downColor : flatColor)
-        let head = prefixCode ? "\(q.code) " : ""
-        let title = String(format: "%@%.2f %@%+.2f%%", head, q.price, arrow, q.changePct)
-        return NSAttributedString(string: title, attributes: [
-            .foregroundColor: color,
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular),
-        ])
-    }
-
-    /// 只重畫報價那幾列；選單開著時走這條，避免整份重建造成閃爍。
-    /// 結構有變（增刪標的）回 false，交給 buildMenu 全建。
-    private func updateQuoteRows() -> Bool {
-        guard menu.numberOfItems >= config.symbols.count else { return false }
-        for (i, sym) in config.symbols.enumerated() {
-            guard let item = menu.item(at: i),
-                  item.action == #selector(selectSymbol(_:)) else { return false }
-            render(sym, into: item, index: i)
+        guard let sym = store.activeSymbol, let q = store.quotes[sym.code] else {
+            if store.quotes.isEmpty { statusItem.button?.title = "StockBar —" }
+            return
         }
-        return true
+        // 「價格 ▲漲跌%」
+        statusItem.button?.attributedTitle = NSAttributedString(
+            string: "\(Fmt.price(q.price)) \(arrow(q.change))\(Fmt.pct(q.changePct))",
+            attributes: [.foregroundColor: color(q.change), .font: font])
     }
 
-    private func render(_ sym: SymbolConfig, into item: NSMenuItem, index: Int) {
-        item.target = self
-        item.tag = index
-        item.state = (sym.code == activeSymbol?.code) ? .on : .off
-        if let q = quotes[sym.code] {
-            let mut = NSMutableAttributedString(string: "\(q.name)  ")
-            mut.append(titleAttr(for: q, prefixCode: false))
-            let live = q.isLive ? "" : "  ·closed"
-            mut.append(NSAttributedString(string: live, attributes: [.foregroundColor: NSColor.secondaryLabelColor]))
-            item.attributedTitle = mut
-        } else {
-            item.title = "\(sym.code)  Loading…"
+    private func arrow(_ v: Double) -> String { v > 0 ? "▲" : (v < 0 ? "▼" : "＝") }
+
+    // 台股習慣：紅漲綠跌（與美股相反）
+    private func color(_ v: Double) -> NSColor {
+        v > 0 ? .systemRed : (v < 0 ? .systemGreen : .labelColor)
+    }
+
+    // MARK: - 面板
+
+    @objc private func togglePanel() {
+        if panel.isVisible { closePanel() } else { showPanel() }
+    }
+
+    private func showPanel() {
+        guard let button = statusItem.button, let btnWin = button.window else { return }
+
+        // 開啟才建 SwiftUI 內容（狀態也每次重建）、關閉即拆，idle 時零渲染
+        let root = PopoverView(store: store, ui: PanelState(), onQuit: { NSApp.terminate(nil) })
+        let host = NSHostingController(rootView: root)
+        host.sizingOptions = [.preferredContentSize]
+        panel.contentViewController = host
+        store.refresh()
+
+        // 依內容自適應大小，置於 status item 正下方、不超出螢幕
+        panel.layoutIfNeeded()
+        let size = panel.contentView?.fittingSize ?? NSSize(width: Style.width, height: 400)
+        panel.setContentSize(size)
+        let rect = btnWin.convertToScreen(button.convert(button.bounds, to: nil))
+        var x = rect.midX - size.width / 2
+        if let vf = (btnWin.screen ?? NSScreen.main)?.visibleFrame {
+            x = min(max(x, vf.minX + 8), vf.maxX - size.width - 8)
         }
-    }
-
-    private func buildMenu() {
-        menu.removeAllItems()
-
-        // 每檔一列：點選即設為作用中（顯示在 menu bar）
-        for (i, sym) in config.symbols.enumerated() {
-            let item = NSMenuItem(title: "", action: #selector(selectSymbol(_:)), keyEquivalent: "")
-            render(sym, into: item, index: i)
-            menu.addItem(item)
-        }
-
-        menu.addItem(.separator())
-        add(menu, "Add Symbol…", action: #selector(addSymbol))
-
-        // Remove: submenu listing every tracked symbol
-        let removeItem = NSMenuItem(title: "Remove Symbol", action: nil, keyEquivalent: "")
-        if config.symbols.isEmpty {
-            removeItem.isEnabled = false
-        } else {
-            let sub = NSMenu()
-            for (i, sym) in config.symbols.enumerated() {
-                let name = quotes[sym.code]?.name ?? sym.code
-                let it = NSMenuItem(title: "\(name) (\(sym.code))", action: #selector(removeSymbol(_:)), keyEquivalent: "")
-                it.target = self
-                it.tag = i
-                sub.addItem(it)
-            }
-            removeItem.submenu = sub
-        }
-        menu.addItem(removeItem)
-
-        menu.addItem(.separator())
-        let login = add(menu, "Launch at Login", action: #selector(toggleLaunchAtLogin))
-        login.state = LaunchAgent.isEnabled ? .on : .off
-        add(menu, "Refresh Now", action: #selector(manualRefresh))
-        add(menu, "Open Config…", action: #selector(openConfig))
-        add(menu, "Check for Updates…", action: #selector(checkForUpdates))
-        add(menu, "Quit", action: #selector(quit), key: "q")
-    }
-
-    @discardableResult
-    private func add(_ menu: NSMenu, _ title: String, action: Selector? = nil,
-                     key: String = "") -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
-        item.target = self
-        menu.addItem(item)
-        return item
-    }
-
-    // MARK: - 動作
-    @objc private func selectSymbol(_ sender: NSMenuItem) {
-        guard config.symbols.indices.contains(sender.tag) else { return }
-        config.activeIndex = sender.tag
-        ConfigStore.save(config)      // 記住選擇
-        renderActive()
-        buildMenu()
-    }
-
-    @objc private func addSymbol() {
+        panel.setFrameOrigin(NSPoint(x: x, y: rect.minY - size.height - 6))
+        panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = "Add Symbol"
-        alert.informativeText = "Enter a stock code (e.g. 2330). Check the box for OTC (上櫃) stocks."
-        alert.addButton(withTitle: "Add")
-        alert.addButton(withTitle: "Cancel")
 
-        let field = NSTextField(frame: NSRect(x: 0, y: 24, width: 220, height: 24))
-        field.placeholderString = "Stock code"
-        let otc = NSButton(checkboxWithTitle: "OTC (上櫃)", target: nil, action: nil)
-        otc.frame = NSRect(x: 0, y: 0, width: 220, height: 20)
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 48))
-        container.addSubview(field)
-        container.addSubview(otc)
-        alert.accessoryView = container
-        alert.window.initialFirstResponder = field
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let code = field.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !code.isEmpty else { return }
-        guard !config.symbols.contains(where: { $0.code == code }) else { return }  // 去重
-        config.symbols.append(SymbolConfig(code: code, market: otc.state == .on ? "otc" : "tse"))
-        ConfigStore.save(config)
-        refresh()
-    }
-
-    @objc private func removeSymbol(_ sender: NSMenuItem) {
-        guard config.symbols.indices.contains(sender.tag) else { return }
-        config.symbols.remove(at: sender.tag)
-        // active 索引防呆
-        let i = config.activeIndex ?? 0
-        config.activeIndex = config.symbols.isEmpty ? 0 : min(i, config.symbols.count - 1)
-        ConfigStore.save(config)
-        refresh()
-    }
-
-    @objc private func toggleLaunchAtLogin() {
-        if LaunchAgent.isEnabled { LaunchAgent.disable() } else { LaunchAgent.enable() }
-        buildMenu()
-    }
-
-    @objc private func manualRefresh() { refresh() }
-
-    /// 只比對版本、只開 release 頁；不下載、不替換（理由見 Updater.swift）
-    @objc private func checkForUpdates() {
-        Updater.check { [weak self] result in
-            guard self != nil else { return }
-            NSApp.activate(ignoringOtherApps: true)
-            let alert = NSAlert()
-            switch result {
-            case .available(let latest, let current):
-                alert.messageText = "Update available"
-                alert.informativeText = "StockBar \(latest) is out (you have \(current))."
-                alert.addButton(withTitle: "Open Release Page")
-                alert.addButton(withTitle: "Later")
-                if alert.runModal() == .alertFirstButtonReturn {
-                    NSWorkspace.shared.open(Updater.releasesPage)
-                }
-            case .upToDate(let current):
-                alert.messageText = "You're up to date"
-                alert.informativeText = "StockBar \(current) is the latest release."
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
-            case .failed:
-                alert.messageText = "Couldn't check for updates"
-                alert.informativeText = "GitHub was unreachable or returned no release. Try again later."
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
-            }
+        // 點面板外（含桌面 / 其他 app）即關閉
+        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) {
+            [weak self] _ in self?.closePanel()
         }
     }
 
-    @objc private func openConfig() {
-        ConfigStore.save(config)      // 確保檔案存在再開
-        NSWorkspace.shared.open(ConfigStore.file)
+    @objc private func closePanel() {
+        guard panel?.isVisible == true else { return }
+        panel.orderOut(nil)
+        if let m = clickMonitor { NSEvent.removeMonitor(m); clickMonitor = nil }
+        panel.contentViewController = nil
     }
 
-    @objc private func quit() { NSApp.terminate(nil) }
+    /// accessory app 不顯示主選單，但輸入框的 ⌘X/⌘C/⌘V/⌘A 要靠它分派（nil-target 走 responder chain）
+    private func installEditMenu() {
+        let mainMenu = NSMenu()
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: "Edit")
+        editItem.submenu = editMenu
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        NSApp.mainMenu = mainMenu
+    }
 }
 
 // menu-bar only，不進 Dock
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-let delegate = StockBarApp()
+let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
